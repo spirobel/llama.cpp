@@ -4,7 +4,6 @@
 #include <vector>
 #include "common.h"
 #include "llama.h"
-#include "grammar-parser.h"
 #include "api-llama.h"
 
 bool cstring_to_params(char *argstring, gpt_params &params);
@@ -29,24 +28,25 @@ bool cstring_to_params(char *argstring, gpt_params &params)
     return gpt_params_parse(argc, argv, params);
 }
 
-struct llama_parts *load_model(char *args)
+struct llama_model *load_model(char *args)
 {
     gpt_params params;
     if (!cstring_to_params(args, params))
     {
         return NULL;
     }
-    // fprintf(stderr, "params->model: %s ", params.model.c_str());
 
-    struct llama_parts *lparts = new struct llama_parts;
-
+    // init LLM
     llama_backend_init(params.numa);
-    std::tie(lparts->model, lparts->ctx) = llama_init_from_gpt_params(params);
 
-    return lparts;
+    // initialize the model
+    auto mparams = llama_model_params_from_gpt_params(params);
+
+    llama_model *model = llama_load_model_from_file(params.model.c_str(), mparams);
+    return model;
 }
 
-void prompt(char *prompt, struct llama_parts *parts, char *args, void (*prompt_callback)(const char *response), char *grammar_str)
+void prompt(char *prompt, struct llama_model *model, char *args, void (*prompt_callback)(const char *response, uint64_t len))
 {
 
     gpt_params params;
@@ -56,37 +56,20 @@ void prompt(char *prompt, struct llama_parts *parts, char *args, void (*prompt_c
     }
     auto lparams = llama_context_params_from_gpt_params(params);
 
-    llama_context *ctx = llama_new_context_with_model(parts->model, lparams);
+    llama_context *ctx = llama_new_context_with_model(model, lparams);
+    llama_set_rng_seed(ctx, params.seed);
 
-    llama_grammar *grammar = nullptr;
-    if (grammar_str)
-    {
-        auto parsed_grammar = grammar_parser::parse(grammar_str);
-        // will be empty (default) if there are parse errors
-        if (parsed_grammar.rules.empty())
-        {
-            fprintf(stderr, "grammar parse error");
-        }
-        grammar_parser::print_grammar(stderr, parsed_grammar);
+    // total length of the sequence including the prompt
+    const int n_len = 200;
 
-        std::vector<const llama_grammar_element *> grammar_rules(parsed_grammar.c_rules());
-        grammar = llama_grammar_init(
-            grammar_rules.data(), grammar_rules.size(), parsed_grammar.symbol_ids.at("root"));
-    }
+    // tokenize the prompt
 
     std::vector<llama_token> tokens_list;
     tokens_list = ::llama_tokenize(ctx, prompt, true);
 
-    const int max_context_size = llama_n_ctx(ctx);
-    const int max_tokens_list_size = max_context_size - 4;
+    // print the prompt token-by-token
 
-    if ((int)tokens_list.size() > max_tokens_list_size)
-    {
-        fprintf(stderr, "%s: error: prompt too long (%d tokens, max %d)\n", __func__, (int)tokens_list.size(), max_tokens_list_size);
-        return;
-    }
-
-    fprintf(stderr, "\n\n");
+    fprintf(stderr, "\n");
 
     for (auto id : tokens_list)
     {
@@ -95,49 +78,92 @@ void prompt(char *prompt, struct llama_parts *parts, char *args, void (*prompt_c
 
     fflush(stderr);
 
-    std::vector<llama_token> last_tokens(max_context_size);
-    std::fill(last_tokens.begin(), last_tokens.end(), 0);
+    // create a llama_batch with size 512
+    // we use this object to submit token data for decoding
 
-    for (auto &id : tokens_list)
+    llama_batch batch = llama_batch_init(512, 0);
+
+    // evaluate the initial prompt
+    batch.n_tokens = tokens_list.size();
+
+    for (int32_t i = 0; i < batch.n_tokens; i++)
     {
-        last_tokens.erase(last_tokens.begin());
-        last_tokens.push_back(id);
+        batch.token[i] = tokens_list[i];
+        batch.pos[i] = i;
+        batch.seq_id[i] = 0;
+        batch.logits[i] = false;
     }
 
-    const int n_gen = std::min(32, max_context_size);
+    // llama_decode will output logits only for the last token of the prompt
+    batch.logits[batch.n_tokens - 1] = true;
 
-    const int n_vocab = llama_n_vocab(ctx);
-
-    std::vector<llama_token_data> candidates;
-    candidates.reserve(n_vocab);
-
-    while (llama_get_kv_cache_token_count(ctx) < n_gen)
+    if (llama_decode(ctx, batch) != 0)
     {
-        // evaluate the transformer
+        printf("%s: llama_decode() failed\n", __func__);
+        return;
+    }
 
-        if (llama_eval(ctx, tokens_list.data(), int(tokens_list.size()), llama_get_kv_cache_token_count(ctx), params.n_threads))
+    // main loop
+
+    int n_cur = batch.n_tokens;
+    int n_decode = 0;
+
+    while (n_cur <= n_len)
+    {
+        // sample the next token
         {
-            fprintf(stderr, "%s : failed to eval\n", __func__);
+            auto n_vocab = llama_n_vocab(model);
+            auto *logits = llama_get_logits_ith(ctx, batch.n_tokens - 1);
+
+            std::vector<llama_token_data> candidates;
+            candidates.reserve(n_vocab);
+
+            for (llama_token token_id = 0; token_id < n_vocab; token_id++)
+            {
+                candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
+            }
+
+            llama_token_data_array candidates_p = {candidates.data(), candidates.size(), false};
+
+            // sample the most likely token
+            const llama_token new_token_id = llama_sample_token_greedy(ctx, &candidates_p);
+
+            // is it an end of stream?
+            if (new_token_id == llama_token_eos(ctx) || n_cur == n_len)
+            {
+                printf("\n");
+
+                break;
+            }
+            auto new_chars = llama_token_to_piece(ctx, new_token_id);
+            prompt_callback(new_chars.c_str(), new_chars.size());
+            std::string carrot = "🥕";
+            if (new_chars.find("bot") != std::string::npos)
+            {
+                prompt_callback(carrot.c_str(), carrot.size());
+            }
+
+            // prepare the next batch
+            batch.n_tokens = 0;
+
+            // push this new token for next evaluation
+            batch.token[batch.n_tokens] = new_token_id;
+            batch.pos[batch.n_tokens] = n_cur;
+            batch.seq_id[batch.n_tokens] = 0;
+            batch.logits[batch.n_tokens] = true;
+
+            batch.n_tokens += 1;
+
+            n_decode += 1;
+        }
+
+        n_cur += 1;
+
+        // evaluate the current batch with the transformer model
+        if (llama_decode(ctx, batch))
+        {
+            fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return;
         }
-
-        tokens_list.clear();
-
-        // sample the next token
-
-        llama_token new_token_id = 0;
-        new_token_id = llama_sample_token(ctx, NULL, grammar, params, last_tokens, candidates);
-
-        // is it an end of stream ?
-        if (new_token_id == llama_token_eos(ctx))
-        {
-            fprintf(stderr, " [end of text]\n");
-            break;
-        }
-        // print the new token :
-        prompt_callback(llama_token_to_piece(ctx, new_token_id).c_str());
-
-        // push this new token for next evaluation
-        tokens_list.push_back(new_token_id);
     }
 }
