@@ -166,4 +166,7 @@ void prompt(char *prompt, struct llama_model *model, char *args, void (*prompt_c
             return;
         }
     }
+    llama_batch_free(batch);
+
+    llama_free(ctx);
 }
