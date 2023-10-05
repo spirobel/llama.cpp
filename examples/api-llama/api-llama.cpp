@@ -137,11 +137,11 @@ void prompt(char *prompt, struct llama_model *model, char *args, void (*prompt_c
             }
             auto new_chars = llama_token_to_piece(ctx, new_token_id);
             prompt_callback(new_chars.c_str(), new_chars.size());
-            std::string carrot = "🥕";
-            if (new_chars.find("bot") != std::string::npos)
-            {
-                prompt_callback(carrot.c_str(), carrot.size());
-            }
+            // std::string carrot = "🥕";
+            // if (new_chars.find("bot") != std::string::npos)
+            // {
+            //     prompt_callback(carrot.c_str(), carrot.size());
+            // }
 
             // prepare the next batch
             batch.n_tokens = 0;
