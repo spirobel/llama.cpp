@@ -565,6 +565,9 @@ train.o: common/train.cpp common/train.h
 api-llama.o: examples/api-llama/api-llama.cpp examples/api-llama/api-llama.h build-info.h 
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+api-llama.so: api-llama.o llama.o ggml.o $(COMMON_DEPS) $(OBJS)
+	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
+
 libllama.so: llama.o ggml.o $(OBJS)
 	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
 
@@ -650,9 +653,6 @@ speculative: examples/speculative/speculative.cpp build-info.h ggml.o llama.o $(
 
 parallel: examples/parallel/parallel.cpp build-info.h ggml.o llama.o $(COMMON_DEPS) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
-
-api-llama.so: api-llama.o llama.o ggml.o common.o grammar-parser.o  $(OBJS)
-	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
 
 ifdef LLAMA_METAL
 metal: examples/metal/metal.cpp ggml.o $(OBJS)
